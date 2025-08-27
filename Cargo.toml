@@ -42,4 +42,4 @@ openblas-system = [
     "annembed/openblas-system",
 ]
 
-macos = ["annembed/macos-accelerate"]
+macos-accelerate = ["annembed/macos-accelerate"]
