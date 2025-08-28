@@ -79,7 +79,7 @@ pub fn pcoa_randomized(dist: &Array2<f64>, opts: FpcoaOptions) -> PCoAResult {
     f_matrix_inplace(&row_means, global_mean, &mut b);
 
     // Total variance = trace(B)
-    let trace_b: f64 = b.diag().sum();
+    let _trace_b: f64 = b.diag().sum();
 
     // randomized range finder (fixed-rank)
     let k_wanted = opts.k.min(n);
@@ -129,8 +129,8 @@ pub fn pcoa_randomized(dist: &Array2<f64>, opts: FpcoaOptions) -> PCoAResult {
     }
 
     // Proportion explained
-    let denom = if trace_b.abs() > 0.0 { trace_b } else { 1.0 };
-    let prop = &vals_k / denom;
+    let denom = vals_k.sum().max(1e-300);   // sum of returned (k) eigenvalues
+    let prop  = &vals_k / denom;
 
     PCoAResult {
         eigenvalues: vals_k,
