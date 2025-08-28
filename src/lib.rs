@@ -10,7 +10,7 @@
 //! 6) U ≈ Q * V_k
 //! 7) Coordinates = U * sqrt(Λ_k)
 
-use ndarray::{s, Array1, Array2, Axis};
+use ndarray::{s, Array1, Array2, Axis, ArrayView2};
 use ndarray::parallel::prelude::*;
 use std::cmp::Ordering;
 
@@ -57,25 +57,14 @@ impl Default for FpcoaOptions {
 /// Perform PCoA via randomized range finder + symmetric eig on the small core.
 /// * `dist`: N×N dense symmetric distance matrix, with zeros on the diagonal.
 /// * `opts.k`: number of returned components.
-pub fn pcoa_randomized(dist: &Array2<f64>, opts: FpcoaOptions) -> PCoAResult {
+pub fn pcoa_randomized(dist: ArrayView2<'_, f64>, opts: FpcoaOptions) -> PCoAResult {
     let (n, m) = dist.dim();
     assert_eq!(n, m, "distance matrix must be square");
     assert!(opts.k > 0, "k must be > 0");
 
-    // Optional symmetry enforcement (numerical safety)
-    let d = if opts.symmetrize_input {
-        let mut sym = dist.clone();
-        sym.zip_mut_with(&dist.t().to_owned(), |a, b| *a = 0.5 * (*a + *b));
-        sym
-    } else {
-        dist.clone()
-    };
-
-    // E = -0.5 * (D ∘ D), collect row means and global mean
+    // Build B from D directly into `b` (no clone of D)
     let mut b = Array2::<f64>::zeros((n, n));
-    let (row_means, global_mean) = e_matrix_means(&d, &mut b);
-
-    // B = E - row_means - col_means + global_mean
+    let (row_means, global_mean) = e_matrix_means_view(dist, opts.symmetrize_input, &mut b);
     f_matrix_inplace(&row_means, global_mean, &mut b);
 
     // Total variance = trace(B)
@@ -83,36 +72,30 @@ pub fn pcoa_randomized(dist: &Array2<f64>, opts: FpcoaOptions) -> PCoAResult {
 
     // randomized range finder (fixed-rank)
     let k_wanted = opts.k.min(n);
-    let r = (k_wanted + opts.oversample).min(n).max(k_wanted); // sketch rank
+    let r = (k_wanted + opts.oversample).min(n).max(k_wanted);
 
     // Q: (n × r), orthonormal columns
     let q = subspace_iteration_full::<f64>(&b, r, opts.nbiter);
 
-    // small symmetric core:B_r=QᵀBQ 
+    // small symmetric core: B_r = Qᵀ B Q
     let mut b_small = q.t().dot(&b).dot(&q); // (r × r)
-    symmetrize_inplace_upper(&mut b_small);  // numerical safety
+    symmetrize_inplace_upper(&mut b_small);
 
     // symmetric eig (nalgebra)
-    let (mut vals, mut vecs) = symmetric_eigh_small(&b_small); // vals len r; vecs r×r (columns = eigenvectors)
-
-    // sort eigenpairs in descending order
+    let (mut vals, mut vecs) = symmetric_eigh_small(&b_small);
     sort_eig_desc_inplace(&mut vals, &mut vecs);
 
-    // zero out negatives
-    let zero_thresh = 0.0_f64;
-    let num_pos = vals.iter().take_while(|x| **x >= zero_thresh).count();
-    if num_pos < vals.len() {
-        for i in num_pos..vals.len() {
-            vals[i] = 0.0;
-            let mut col = vecs.column_mut(i);
-            col.fill(0.0);
-        }
+    // zero out negatives (vals sorted ↓)
+    let num_pos = vals.iter().take_while(|x| **x >= 0.0).count();
+    for i in num_pos..vals.len() {
+        vals[i] = 0.0;
+        vecs.column_mut(i).fill(0.0);
     }
 
     // truncate to top-k
     let k_keep = k_wanted.min(vals.len()).min(vecs.ncols());
-    let vals_k = vals.slice_move(s![..k_keep]);
-    let vecs_k = vecs.slice_move(s![.., ..k_keep]); // (r × k)
+    let vals_k  = vals.slice_move(s![..k_keep]);
+    let vecs_k  = vecs.slice_move(s![.., ..k_keep]); // (r × k)
 
     // U ≈ Q * V_k  => (n × k)
     let u_left = q.dot(&vecs_k);
@@ -121,30 +104,57 @@ pub fn pcoa_randomized(dist: &Array2<f64>, opts: FpcoaOptions) -> PCoAResult {
     let sqrt_vals = vals_k.mapv(f64::sqrt);
     let mut coords = u_left.clone();
     for (mut col, s) in coords.axis_iter_mut(Axis(1)).zip(sqrt_vals.iter()) {
-        if *s > 0.0 {
-            col *= *s;
-        } else {
-            col.fill(0.0);
-        }
+        if *s > 0.0 { col *= *s; } else { col.fill(0.0); }
     }
 
-    // Proportion explained
-    // Denominator to match scikit-bio: sum of ALL positive eigenvalues of full B
+    // Proportion explained: fast denominator for large n
     let denom_pos_all = if b.nrows() <= 2000 {
-        // exact, but only for modest sizes
         sum_positive_eigs_full(&b)
     } else {
-        // fast and stable: in metric PCoA, negatives are tiny → trace(B) ≈ sum of positives
         trace_b.max(1e-300)
     };
 
-    // Proportions for the returned axes, using scikit-bio’s denominator
     let prop = &vals_k / denom_pos_all;
+
     PCoAResult {
-        eigenvalues: vals_k,
+        eigenvalues: vals_k,        // move happens here
         coordinates: coords,
-        proportion_explained: prop,
+        proportion_explained: prop, // uses the already-computed owned array
     }
+}
+
+fn e_matrix_means_view(
+    dist: ArrayView2<'_, f64>,
+    symmetrize: bool,
+    centered_out: &mut Array2<f64>,
+) -> (Array1<f64>, f64) {
+    let n = dist.nrows();
+    assert_eq!(n, dist.ncols());
+    assert_eq!(centered_out.dim(), (n, n));
+
+    let row_sums: Vec<f64> = centered_out
+        .axis_iter_mut(Axis(0))
+        .into_par_iter()
+        .enumerate()
+        .map(|(i, mut row)| {
+            let mut sum = 0.0;
+            for j in 0..n {
+                let dij = if symmetrize {
+                    0.5 * (dist[[i, j]] + dist[[j, i]])
+                } else {
+                    dist[[i, j]]
+                };
+                let e = -0.5 * dij * dij;
+                row[j] = e;
+                sum += e;
+            }
+            sum
+        })
+        .collect();
+
+    let row_means = Array1::from_iter(row_sums.iter().map(|&s| s / n as f64));
+    let global_mean = row_sums.iter().sum::<f64>() / (n as f64) / (n as f64);
+    (row_means, global_mean)
 }
 
 fn sum_positive_eigs_full(b: &ndarray::Array2<f64>) -> f64 {
@@ -156,34 +166,6 @@ fn sum_positive_eigs_full(b: &ndarray::Array2<f64>) -> f64 {
     se.eigenvalues.iter().copied().filter(|&x| x > 0.0).sum::<f64>().max(1e-300)
 }
 
-/// Compute E = -0.5 * (D ∘ D), along with row means and global mean(E).
-/// Parallelized by rows without borrowing the whole matrix mutably.
-fn e_matrix_means(dist: &Array2<f64>, centered_out: &mut Array2<f64>) -> (Array1<f64>, f64) {
-    let n = dist.nrows();
-    assert_eq!(n, dist.ncols());
-    assert_eq!(centered_out.dim(), (n, n));
-
-    let row_sums: Vec<f64> = centered_out
-        .axis_iter_mut(Axis(0))
-        .into_par_iter()
-        .enumerate()
-        .map(|(i, mut row)| {
-            let mut sum = 0.0;
-            let di = dist.row(i);
-            for j in 0..n {
-                let dij = di[j];
-                let e = -0.5 * dij * dij;
-                row[j] = e;
-                sum += e;
-            }
-            sum
-        })
-        .collect();
-
-    let row_means = Array1::from_iter(row_sums.iter().map(|s| *s / (n as f64)));
-    let global_mean = row_sums.iter().sum::<f64>() / (n as f64) / (n as f64);
-    (row_means, global_mean)
-}
 
 /// Double-centering: B = E - row_means - col_means + global_mean, in-place.
 /// Parallelized by rows.
@@ -302,7 +284,7 @@ mod tests {
         let k = 2;
         // oversample [8,10] as recommened in Halko–Martinsson–Tropp paper
         let opts = super::FpcoaOptions { k, oversample: 8, nbiter: 2, symmetrize_input: true };
-        let rand_out = super::pcoa_randomized(&dm, opts);
+        let rand_out = super::pcoa_randomized(dm.view(), opts);
         let x = rand_out.coordinates.clone(); // (n × k)
 
         // exact PCoA
