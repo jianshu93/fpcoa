@@ -130,7 +130,13 @@ pub fn pcoa_randomized(dist: &Array2<f64>, opts: FpcoaOptions) -> PCoAResult {
 
     // Proportion explained
     // Denominator to match scikit-bio: sum of ALL positive eigenvalues of full B
-    let denom_pos_all = sum_positive_eigs_full(&b);
+    let denom_pos_all = if b.nrows() <= 2000 {
+        // exact, but only for modest sizes
+        sum_positive_eigs_full(&b)
+    } else {
+        // fast and stable: in metric PCoA, negatives are tiny → trace(B) ≈ sum of positives
+        trace_b.max(1e-300)
+    };
 
     // Proportions for the returned axes, using scikit-bio’s denominator
     let prop = &vals_k / denom_pos_all;
