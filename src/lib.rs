@@ -79,7 +79,7 @@ pub fn pcoa_randomized(dist: &Array2<f64>, opts: FpcoaOptions) -> PCoAResult {
     f_matrix_inplace(&row_means, global_mean, &mut b);
 
     // Total variance = trace(B)
-    let _trace_b: f64 = b.diag().sum();
+    let trace_b: f64 = b.diag().sum();
 
     // randomized range finder (fixed-rank)
     let k_wanted = opts.k.min(n);
@@ -129,14 +129,25 @@ pub fn pcoa_randomized(dist: &Array2<f64>, opts: FpcoaOptions) -> PCoAResult {
     }
 
     // Proportion explained
-    let denom = vals_k.sum().max(1e-300);   // sum of returned (k) eigenvalues
-    let prop  = &vals_k / denom;
+    // Denominator to match scikit-bio: sum of ALL positive eigenvalues of full B
+    let denom_pos_all = sum_positive_eigs_full(&b);
 
+    // Proportions for the returned axes, using scikit-bio’s denominator
+    let prop = &vals_k / denom_pos_all;
     PCoAResult {
         eigenvalues: vals_k,
         coordinates: coords,
         proportion_explained: prop,
     }
+}
+
+fn sum_positive_eigs_full(b: &ndarray::Array2<f64>) -> f64 {
+    let n = b.nrows();
+    assert_eq!(n, b.ncols());
+    // nalgebra symmetric EVD (full); we only need eigenvalues
+    let dm = nalgebra::DMatrix::<f64>::from_row_slice(n, n, b.as_slice().expect("contiguous"));
+    let se = nalgebra::SymmetricEigen::new(dm);
+    se.eigenvalues.iter().copied().filter(|&x| x > 0.0).sum::<f64>().max(1e-300)
 }
 
 /// Compute E = -0.5 * (D ∘ D), along with row means and global mean(E).
