@@ -13,7 +13,7 @@ fpcoa = "0.1.0"
 
 ## Usage
 ```bash
-use fpcoa::{pcoa_randomized, FpcoaOptions};
+use fpcoa::{pcoa_randomized_inplace, FpcoaOptions};
 use ndarray::Array2;
 
 fn main() {
@@ -46,7 +46,7 @@ fn main() {
         nbiter: 2,          // q
         symmetrize_input: true,
     };
-
+    // you can use pcoa_randomized_inplace_f32() for fp32
     let res = pcoa_randomized_inplace(&dist, opts);
 
     println!("eigenvalues (top k):     {:?}", res.eigenvalues);
