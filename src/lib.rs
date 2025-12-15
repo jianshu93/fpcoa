@@ -191,88 +191,69 @@ pub fn pcoa_randomized_inplace(dist: &mut Array2<f64>, opts: FpcoaOptions) -> PC
     }
 }
 
-/// Memory-efficient in-place randomized PCoA using f32.
-/// Converts only the small r×r core to f64 for high-precision eigendecomposition.
+/// NEW: Memory-efficient PCoA **for f32 distance matrices**, in-place.
+/// - `dist` is an N×N distance matrix in f32 (dense, symmetric, diag=0).
+/// - `dist` is overwritten with the centered matrix B in f32.
+/// - Eigen-decomposition and returned coordinates are still in f64.
 pub fn pcoa_randomized_inplace_f32(dist: &mut Array2<f32>, opts: FpcoaOptions) -> PCoAResult {
     let (n, m) = dist.dim();
     assert_eq!(n, m, "distance matrix must be square");
     assert!(opts.k > 0, "k must be > 0");
 
-    // Build B in-place from D (single-pass)
-    let mut row_means = Array1::<f32>::zeros(n);
-    let mut global_sum = 0f64;
-    dist
-        .axis_iter_mut(Axis(0))
-        .into_par_iter()
-        .enumerate()
-        .for_each(|(i, mut row)| {
-            let mut sum = 0f32;
-            for j in 0..n {
-                let dij = row[j];
-                let e = -0.5f32 * dij * dij;
-                row[j] = e;
-                sum += e;
-            }
-            row_means[i] = sum / (n as f32);
-        });
-    global_sum = row_means.sum() as f64 / (n as f64);
+    // Build B from D directly into `dist` itself (in-place, f32)
+    let (row_means, global_mean) = e_matrix_means_inplace_f32(dist, opts.symmetrize_input);
+    f_matrix_inplace_f32(&row_means, global_mean, dist);
 
-    // Double-centering in-place: B = E - row_means - col_means + global_mean
-    dist
-        .axis_iter_mut(Axis(0))
-        .into_par_iter()
-        .enumerate()
-        .for_each(|(i, mut row)| {
-            let g = (global_sum as f32) - row_means[i];
-            for j in 0..n {
-                row[j] += g - row_means[j];
-            }
-        });
+    // Now `dist` is B (f32). Get trace(B) in f64.
+    let trace_b: f64 = dist.diag().iter().map(|&x| x as f64).sum();
 
-    // Range finder (still in f32)
+    // randomized range finder (fixed-rank) on f32 B
     let k_wanted = opts.k.min(n);
     let r = (k_wanted + opts.oversample).min(n).max(k_wanted);
-    let q = annembed::tools::svdapprox::subspace_iteration_full::<f32>(dist, r, opts.nbiter);
 
-    // Build small core in f64
-    let mut b_small = {
-        let bq = dist.dot(&q);
-        let qt = q.t();
-        let tmp = qt.dot(&bq);
-        Array2::<f64>::from_shape_fn((r, r), |(i, j)| tmp[[i, j]] as f64)
-    };
+    // Q_f32: (n × r), orthonormal columns in f32
+    let q_f32 = subspace_iteration_full::<f32>(&*dist, r, opts.nbiter);
+
+    // small symmetric core in f32: B_r = Qᵀ B Q
+    let b_small_f32 = q_f32.t().dot(&*dist).dot(&q_f32); // (r × r)
+
+    // convert core to f64 and reuse symmetric eig machinery
+    let mut b_small = Array2::<f64>::zeros((r, r));
+    for i in 0..r {
+        for j in 0..r {
+            b_small[[i, j]] = b_small_f32[[i, j]] as f64;
+        }
+    }
     symmetrize_inplace_upper(&mut b_small);
 
-    // Eigen on small core
+    // symmetric eig (nalgebra) on f64 core
     let (mut vals, mut vecs) = symmetric_eigh_small(&b_small);
     sort_eig_desc_inplace(&mut vals, &mut vecs);
 
-    // Zero negatives
+    // zero out negatives (vals sorted ↓)
     let num_pos = vals.iter().take_while(|x| **x >= 0.0).count();
     for i in num_pos..vals.len() {
         vals[i] = 0.0;
         vecs.column_mut(i).fill(0.0);
     }
 
-    // Truncate
+    // truncate to top-k
     let k_keep = k_wanted.min(vals.len()).min(vecs.ncols());
-    let vals_k = vals.slice_move(s![..k_keep]);
-    let vecs_k = vecs.slice_move(s![.., ..k_keep]);
+    let vals_k  = vals.slice_move(s![..k_keep]);        // (k)
+    let vecs_k  = vecs.slice_move(s![.., ..k_keep]);    // (r × k)
 
-    // U = Q * V_k
-    let mut u_left = Array2::<f64>::zeros((n, k_keep));
-    for i in 0..n {
-        for k in 0..k_keep {
-            let mut s = 0f64;
-            for t in 0..r {
-                s += (q[[i, t]] as f64) * vecs_k[[t, k]];
-            }
-            u_left[[i, k]] = s;
+    // U ≈ Q_f32 (cast to f64) * V_k  => (n × k)
+    let (nq, rq) = q_f32.dim();
+    let mut q_f64 = Array2::<f64>::zeros((nq, rq));
+    for i in 0..nq {
+        for j in 0..rq {
+            q_f64[[i, j]] = q_f32[[i, j]] as f64;
         }
     }
+    let u_left: Array2<f64> = q_f64.dot(&vecs_k);
 
-    // Coordinates = U * sqrt(Λ)
-    let sqrt_vals = vals_k.mapv(f64::sqrt);
+    // Coordinates = U * sqrt(Λ_k)
+    let sqrt_vals = vals_k.mapv(|x| if x > 0.0 { x.sqrt() } else { 0.0 });
     let mut coords = u_left.clone();
     for (mut col, s) in coords.axis_iter_mut(Axis(1)).zip(sqrt_vals.iter()) {
         if *s > 0.0 {
@@ -282,8 +263,14 @@ pub fn pcoa_randomized_inplace_f32(dist: &mut Array2<f32>, opts: FpcoaOptions) -
         }
     }
 
-    let trace_b = dist.diag().mapv(|x| x as f64).sum().max(1e-300);
-    let prop = &vals_k / trace_b;
+    // Proportion explained: positive eigenvalues sum (using full f32 B when small).
+    let denom_pos_all = if dist.nrows() <= 2000 {
+        sum_positive_eigs_full_from_f32(dist)
+    } else {
+        trace_b.max(1e-300)
+    };
+
+    let prop = &vals_k / denom_pos_all;
 
     PCoAResult {
         eigenvalues: vals_k,
@@ -328,7 +315,7 @@ fn e_matrix_means_view(
     (row_means, global_mean)
 }
 
-/// NEW: In-place version of E matrix build:
+/// NEW: In-place version of E matrix build (f64):
 /// - Takes `dist` as both input and output.
 /// - Overwrites D with E = -0.5 D∘D, symmetrizing on the fly.
 /// - Returns row_means and global_mean for the subsequent F step.
@@ -377,6 +364,51 @@ fn e_matrix_means_inplace(
     (row_means, global_mean)
 }
 
+/// NEW: In-place E matrix build (f32):
+/// - Takes `dist` as both input and output.
+/// - Overwrites D with E = -0.5 D∘D in f32, but accumulates means in f64.
+fn e_matrix_means_inplace_f32(
+    dist: &mut Array2<f32>,
+    symmetrize: bool,
+) -> (Array1<f64>, f64) {
+    let n = dist.nrows();
+    assert_eq!(n, dist.ncols());
+
+    let mut row_sums = vec![0.0_f64; n];
+    let mut global_sum = 0.0_f64;
+
+    for i in 0..n {
+        for j in i..n {
+            let dij = if symmetrize && i != j {
+                0.5_f32 * (dist[[i, j]] + dist[[j, i]])
+            } else {
+                dist[[i, j]]
+            };
+            let e = -0.5_f32 * dij * dij;
+
+            // write symmetric entries in f32
+            dist[[i, j]] = e;
+            if i != j {
+                dist[[j, i]] = e;
+            }
+
+            let e64 = e as f64;
+            row_sums[i] += e64;
+            if i != j {
+                row_sums[j] += e64;
+                global_sum += 2.0 * e64;
+            } else {
+                global_sum += e64;
+            }
+        }
+    }
+
+    let n_f = n as f64;
+    let row_means = Array1::from_iter(row_sums.into_iter().map(|s| s / n_f));
+    let global_mean = global_sum / (n_f * n_f);
+    (row_means, global_mean)
+}
+
 /// Double-centering: B = E - row_means - col_means + global_mean, in-place.
 /// Parallelized by rows.
 fn f_matrix_inplace(row_means: &Array1<f64>, global_mean: f64, centered: &mut Array2<f64>) {
@@ -392,6 +424,24 @@ fn f_matrix_inplace(row_means: &Array1<f64>, global_mean: f64, centered: &mut Ar
             let gr_mean = global_mean - row_means[i];
             for j in 0..n {
                 row[j] += gr_mean - row_means[j];
+            }
+        });
+}
+
+/// NEW: Double-centering for f32: B = E - row_means - col_means + global_mean, in-place.
+fn f_matrix_inplace_f32(row_means: &Array1<f64>, global_mean: f64, centered: &mut Array2<f32>) {
+    let n = centered.nrows();
+    assert_eq!(n, centered.ncols());
+    assert_eq!(row_means.len(), n);
+
+    centered
+        .axis_iter_mut(Axis(0))
+        .into_par_iter()
+        .enumerate()
+        .for_each(|(i, mut row)| {
+            let gr_mean = (global_mean - row_means[i]) as f32;
+            for j in 0..n {
+                row[j] += gr_mean - (row_means[j] as f32);
             }
         });
 }
@@ -472,6 +522,20 @@ fn sum_positive_eigs_full(b: &Array2<f64>) -> f64 {
         .filter(|&x| x > 0.0)
         .sum::<f64>()
         .max(1e-300)
+}
+
+/// NEW: For small n but B stored in f32, compute ∑ positive eigenvalues by
+/// converting once to f64 and reusing `sum_positive_eigs_full`.
+fn sum_positive_eigs_full_from_f32(b32: &Array2<f32>) -> f64 {
+    let n = b32.nrows();
+    assert_eq!(n, b32.ncols());
+    let mut b64 = Array2::<f64>::zeros((n, n));
+    for i in 0..n {
+        for j in 0..n {
+            b64[[i, j]] = b32[[i, j]] as f64;
+        }
+    }
+    sum_positive_eigs_full(&b64)
 }
 
 #[cfg(test)]
@@ -683,6 +747,131 @@ mod tests {
         assert!(
             rel_var < 1e-12,
             "variance (sum λ) mismatch too large (inplace): {:.3e}",
+            rel_var
+        );
+    }
+
+    /// NEW: test f32 in-place PCoA API against exact f64 PCoA
+    #[test]
+    fn test_pcoa_inplace_f32() {
+        // load TSV distance matrix (same as in test_pcoa)
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/data/test_dm.tsv");
+        let text = std::fs::read_to_string(path).expect("failed to read data/test_dm.tsv");
+
+        let mut lines = text.lines();
+        let header = lines.next().expect("empty file");
+        let headers: Vec<&str> = header
+            .split('\t')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        let n = headers.len();
+        assert!(n > 0);
+
+        // Build exact dm in f64
+        let mut dm_exact = Array2::<f64>::zeros((n, n));
+        let mut i = 0usize;
+        for line in lines {
+            let line = line.trim_end();
+            if line.is_empty() {
+                continue;
+            }
+            let mut toks = line
+                .split('\t')
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let _row_label = toks.next().expect("missing row label");
+            for (j, tok) in toks.enumerate() {
+                dm_exact[[i, j]] = tok.parse::<f64>().expect("parse float");
+            }
+            i += 1;
+        }
+        assert_eq!(i, n, "row count != header count");
+
+        // In-place randomized PCoA on f32 dm
+        let mut dm_f32 = dm_exact.mapv(|x| x as f32);
+        let k = 2;
+        let opts = FpcoaOptions {
+            k,
+            oversample: 8,
+            nbiter: 2,
+            symmetrize_input: true,
+        };
+        let rand_f32 = pcoa_randomized_inplace_f32(&mut dm_f32, opts);
+        let x = rand_f32.coordinates.clone(); // (n × k), f64
+
+        // exact PCoA on the original (non-centered) dm_exact
+        let mut row_major = Vec::with_capacity(n * n);
+        for r in 0..n {
+            for c in 0..n {
+                row_major.push(dm_exact[[r, c]]);
+            }
+        }
+        let dm_na = na::DMatrix::<f64>::from_row_slice(n, n, &row_major);
+        let exact = apply_pcoa(dm_na, k).expect("exact pcoa failed");
+        let y_na = if exact.nrows() == k && exact.ncols() == n {
+            exact.transpose()
+        } else {
+            exact
+        };
+        let mut y = Array2::<f64>::zeros((n, k));
+        for r in 0..n {
+            for c in 0..k {
+                y[[r, c]] = y_na[(r, c)];
+            }
+        }
+
+        // Procrustes (orthogonal) alignment: R = argmin || X R - Y ||_F
+        let mut cxy = na::DMatrix::<f64>::zeros(k, k);
+        for a in 0..k {
+            for b in 0..k {
+                let mut s = 0.0;
+                for r in 0..n {
+                    s += x[[r, a]] * y[[r, b]];
+                }
+                cxy[(a, b)] = s;
+            }
+        }
+        let svd = na::SVD::new(cxy.clone(), true, true);
+        let (u, v_t) = (svd.u.expect("svd u"), svd.v_t.expect("svd vt"));
+        let rmat = &u * &v_t; // k×k
+
+        // X_aligned = X * R
+        let mut x_aligned = Array2::<f64>::zeros((n, k));
+        for r in 0..n {
+            for c in 0..k {
+                let mut s = 0.0;
+                for t in 0..k {
+                    s += x[[r, t]] * rmat[(t, c)];
+                }
+                x_aligned[[r, c]] = s;
+            }
+        }
+
+        // coordinate error (looser tolerance because of f32 internal math)
+        let mut diff2 = 0.0;
+        let mut ref2 = 0.0;
+        for r in 0..n {
+            for c in 0..k {
+                let d = x_aligned[[r, c]] - y[[r, c]];
+                diff2 += d * d;
+                ref2 += y[[r, c]] * y[[r, c]];
+            }
+        }
+        let rel_coords = (diff2.sqrt()) / ref2.sqrt().max(1e-16);
+        assert!(
+            rel_coords < 1e-4,
+            "relative coord error too large (inplace f32): {:.3e}",
+            rel_coords
+        );
+
+        // variance (sum λ) check (rotation invariant)
+        let sum_rand: f64 = rand_f32.eigenvalues.iter().take(k).sum();
+        let sum_exact: f64 = y.iter().map(|v| v * v).sum();
+        let rel_var = ((sum_rand - sum_exact).abs()) / sum_exact.max(1e-16);
+        assert!(
+            rel_var < 1e-4,
+            "variance (sum λ) mismatch too large (inplace f32): {:.3e}",
             rel_var
         );
     }
