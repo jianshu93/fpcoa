@@ -47,7 +47,7 @@ fn main() {
         symmetrize_input: true,
     };
 
-    let res = pcoa_randomized(&dist, opts);
+    let res = pcoa_randomized_inplace(&dist, opts);
 
     println!("eigenvalues (top k):     {:?}", res.eigenvalues);
     println!("proportion explained:    {:?}", res.proportion_explained);
