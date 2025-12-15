@@ -191,6 +191,107 @@ pub fn pcoa_randomized_inplace(dist: &mut Array2<f64>, opts: FpcoaOptions) -> PC
     }
 }
 
+/// Memory-efficient in-place randomized PCoA using f32.
+/// Converts only the small r×r core to f64 for high-precision eigendecomposition.
+pub fn pcoa_randomized_inplace_f32(dist: &mut Array2<f32>, opts: FpcoaOptions) -> PCoAResult {
+    let (n, m) = dist.dim();
+    assert_eq!(n, m, "distance matrix must be square");
+    assert!(opts.k > 0, "k must be > 0");
+
+    // Build B in-place from D (single-pass)
+    let mut row_means = Array1::<f32>::zeros(n);
+    let mut global_sum = 0f64;
+    dist
+        .axis_iter_mut(Axis(0))
+        .into_par_iter()
+        .enumerate()
+        .for_each(|(i, mut row)| {
+            let mut sum = 0f32;
+            for j in 0..n {
+                let dij = row[j];
+                let e = -0.5f32 * dij * dij;
+                row[j] = e;
+                sum += e;
+            }
+            row_means[i] = sum / (n as f32);
+        });
+    global_sum = row_means.sum() as f64 / (n as f64);
+
+    // Double-centering in-place: B = E - row_means - col_means + global_mean
+    dist
+        .axis_iter_mut(Axis(0))
+        .into_par_iter()
+        .enumerate()
+        .for_each(|(i, mut row)| {
+            let g = (global_sum as f32) - row_means[i];
+            for j in 0..n {
+                row[j] += g - row_means[j];
+            }
+        });
+
+    // Range finder (still in f32)
+    let k_wanted = opts.k.min(n);
+    let r = (k_wanted + opts.oversample).min(n).max(k_wanted);
+    let q = annembed::tools::svdapprox::subspace_iteration_full::<f32>(dist, r, opts.nbiter);
+
+    // Build small core in f64
+    let mut b_small = {
+        let bq = dist.dot(&q);
+        let qt = q.t();
+        let tmp = qt.dot(&bq);
+        Array2::<f64>::from_shape_fn((r, r), |(i, j)| tmp[[i, j]] as f64)
+    };
+    symmetrize_inplace_upper(&mut b_small);
+
+    // Eigen on small core
+    let (mut vals, mut vecs) = symmetric_eigh_small(&b_small);
+    sort_eig_desc_inplace(&mut vals, &mut vecs);
+
+    // Zero negatives
+    let num_pos = vals.iter().take_while(|x| **x >= 0.0).count();
+    for i in num_pos..vals.len() {
+        vals[i] = 0.0;
+        vecs.column_mut(i).fill(0.0);
+    }
+
+    // Truncate
+    let k_keep = k_wanted.min(vals.len()).min(vecs.ncols());
+    let vals_k = vals.slice_move(s![..k_keep]);
+    let vecs_k = vecs.slice_move(s![.., ..k_keep]);
+
+    // U = Q * V_k
+    let mut u_left = Array2::<f64>::zeros((n, k_keep));
+    for i in 0..n {
+        for k in 0..k_keep {
+            let mut s = 0f64;
+            for t in 0..r {
+                s += (q[[i, t]] as f64) * vecs_k[[t, k]];
+            }
+            u_left[[i, k]] = s;
+        }
+    }
+
+    // Coordinates = U * sqrt(Λ)
+    let sqrt_vals = vals_k.mapv(f64::sqrt);
+    let mut coords = u_left.clone();
+    for (mut col, s) in coords.axis_iter_mut(Axis(1)).zip(sqrt_vals.iter()) {
+        if *s > 0.0 {
+            col *= *s;
+        } else {
+            col.fill(0.0);
+        }
+    }
+
+    let trace_b = dist.diag().mapv(|x| x as f64).sum().max(1e-300);
+    let prop = &vals_k / trace_b;
+
+    PCoAResult {
+        eigenvalues: vals_k,
+        coordinates: coords,
+        proportion_explained: prop,
+    }
+}
+
 /// Original (non-inplace) E matrix build:
 /// Writes E = -0.5 D∘D into `centered_out`.
 fn e_matrix_means_view(
